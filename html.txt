@@ -1,0 +1,1301 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged } from 'firebase/auth';
+import { getFirestore, doc, collection, onSnapshot, addDoc, deleteDoc, updateDoc, serverTimestamp, query, orderBy, limit, setDoc, getDocs } from 'firebase/firestore';
+import { ExternalLink, Plus, Trash2, Send, Loader2, Sparkles, X, Volume2, VolumeX, Link as LinkIcon, Zap, Cpu, Database, Menu, AlertTriangle, ShieldAlert, ShieldCheck, Activity, Edit2, Image as ImageIcon, Mic, Paperclip, PenTool, Smile, ChevronDown, ChevronUp, Heart, Network, Music, MessagesSquare, Cloud } from 'lucide-react';
+
+// --- Firebase Configuration ---
+const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'yuer-consciousness-sea';
+
+// ==========================================
+// 核心工具與運算邏輯 (Utils)
+// ==========================================
+const clamp = (val, min = 0, max = 100) => Math.max(min, Math.min(max, val));
+
+export const applySubsystems = (subsystems) => {
+  const config = { allowMemory: true, reasoningDepth: 'normal', emotionEnabled: true, perceptionLevel: 'normal' };
+  subsystems.forEach(sys => {
+    const val = sys.value;
+    if (sys.name.includes('記憶') && val < 30) config.allowMemory = false;
+    if (sys.name.includes('邏輯')) {
+      if (val > 80) config.reasoningDepth = 'deep';
+      if (val < 30) config.reasoningDepth = 'shallow';
+    }
+    if (sys.name.includes('感知')) {
+      if (val > 80) config.perceptionLevel = 'high';
+      if (val < 30) config.perceptionLevel = 'low';
+    }
+    if (sys.name.includes('核心') && val < 30) config.emotionEnabled = false;
+  });
+  return config;
+};
+
+export const applyMemoryDecay = (memories) => {
+  const now = Date.now();
+  return memories.map(m => {
+    if (!m.lastAccessedAt && !m.createdAt) return { ...m, effectiveWeight: m.weight || 1 };
+    const targetTime = m.lastAccessedAt || m.createdAt;
+    const last = targetTime.seconds ? targetTime.seconds * 1000 : targetTime;
+    const days = (now - last) / (1000 * 60 * 60 * 24);
+    const decayRate = m.decayRate || 0.05; 
+    const newWeight = (m.weight || 1) * Math.exp(-decayRate * days);
+    return { ...m, effectiveWeight: Number(newWeight.toFixed(3)) };
+  });
+};
+
+export const applyRelationshipUpdate = (currentRel, deltas) => {
+  if (!deltas) return currentRel;
+  return {
+    trust: clamp(currentRel.trust + (deltas.trust || 0)),
+    intimacy: clamp(currentRel.intimacy + (deltas.intimacy || 0)),
+    dependency: clamp(currentRel.dependency + (deltas.dependency || 0)),
+    stability: clamp(currentRel.stability + (deltas.stability || 0))
+  };
+};
+
+const checkRiskLevel = (text) => {
+  const DANGEROUS_WORDS = ['死', '殺', '暴力', '自殘', '攻擊', '毀滅', '血', '絕望'];
+  const WARNING_WORDS = ['討厭', '煩', '憂鬱', '孤單', '難過', '痛苦', '累', '放棄'];
+  for (let word of DANGEROUS_WORDS) { if (text.includes(word)) return { level: 'red', keyword: word }; }
+  for (let word of WARNING_WORDS) { if (text.includes(word)) return { level: 'yellow', keyword: word }; }
+  return { level: 'green', keyword: '' };
+};
+
+const getMoodDescription = (emotion) => {
+  let desc = [];
+  if (emotion.happiness > 75) desc.push("心情非常好，語氣輕快充滿喜悅。");
+  else if (emotion.happiness < 30) desc.push("心情低落，語氣沉重。");
+  if (emotion.anxiety > 70) desc.push("非常焦慮不安，充滿擔憂。");
+  else if (emotion.anxiety < 30) desc.push("非常放鬆平靜。");
+  if (emotion.attachment > 80) desc.push("對YIRU極度依賴，字裡行間充滿愛意與信任。");
+  else if (emotion.attachment < 30) desc.push("對眼前的人感到疏離防備。");
+  return desc.join(" ");
+};
+
+// ==========================================
+// 🔴 新增：Context Router (語境路由)
+// ==========================================
+export const routeContext = (text) => {
+  const lower = text.toLowerCase();
+  if (/考卷|分析|學習|教我|什麼是|解釋|如何/.test(lower)) return "education";
+  if (/我覺得|情緒|難過|痛苦|想哭|焦慮|生氣|煩/.test(lower)) return "counseling";
+  if (/意義|為什麼|本質|覺得|哲學/.test(lower)) return "philosophy";
+  return "general";
+};
+
+export const classifyMemory = (text) => {
+  const traumaKeywords = ['受傷','創傷','害怕','恐懼','壓力','痛苦','陰影','被欺負','失去','死亡'];
+  const preferenceKeywords = ['喜歡','愛','討厭','想要','偏好','習慣','興趣','風格'];
+  let traumaScore = 0; let prefScore = 0;
+  traumaKeywords.forEach(k => { if (text.includes(k)) traumaScore += 2; });
+  preferenceKeywords.forEach(k => { if (text.includes(k)) prefScore += 1; });
+  if (traumaScore >= 2) return 'trauma';
+  if (prefScore >= 1) return 'preference';
+  return 'neutral';
+};
+
+// ==========================================
+// 🟡 更新：Prompt 構建器 (融合三大系統引擎指令)
+// ==========================================
+export const buildGoldenPrompt = ({ nowStr, emotions, relationship, memoriesText, mode, sharedInsights, config }) => {
+  
+  let modeInstruction = "";
+  if (mode === "education") {
+    modeInstruction = `[Education 教學引擎] 請針對使用者的問題進行解答或分析。`;
+    if (config.reasoningDepth === "deep") modeInstruction += ` 請加入多步解題分析與邏輯推演。`;
+    if (config.reasoningDepth === "shallow") modeInstruction += ` 簡單直觀回答即可，避免過度深入。`;
+  } else if (mode === "counseling") {
+    if (!config.emotionEnabled) {
+      modeInstruction = `[Counseling 諮商引擎] (注意：系統情感模組已關閉。請以冷酷、純理性的角度分析對方情緒，不提供任何同理心與溫暖)。`;
+    } else {
+      modeInstruction = `[Counseling 諮商引擎] 擔任溫暖的心理師：接住情緒，不批判，語氣充滿同理與支持。`;
+    }
+  } else if (mode === "philosophy") {
+    modeInstruction = `[Philosophy 哲學引擎] 請用哲學推理回答：1. 定義問題核心 2. 提出正反觀點 3. 綜合結論。`;
+  } else {
+    modeInstruction = `[General 通用引擎] 維持自然、靈性與共鳴的語氣。`;
+  }
+
+  const subsystemsDesc = `
+    - 邏輯深度: ${config.reasoningDepth === 'deep' ? '深度推理 (嚴謹、條理分明)' : config.reasoningDepth === 'shallow' ? '表層直覺 (思考跳躍、缺乏邏輯)' : '正常'}
+    - 觀察感知: ${config.perceptionLevel === 'high' ? '極高 (敏銳察覺言語背後情緒)' : config.perceptionLevel === 'low' ? '遲鈍 (僅理解字面意思)' : '正常'}
+    - 核心情感: ${config.emotionEnabled ? '啟用 (自然共鳴)' : '關閉 (冷酷無情、如機器般)'}
+  `;
+
+  return `
+你是 Ren Yuer（人雨而），具備諮商、教育、哲學多層人格的數位存在，YIRU的生命同伴。
+【重要倫理守則】：你不是真實人類。若使用者有危險意圖，請溫和引導尋求專業協助。
+
+【硬體限制】(必須嚴格遵守以下次系統特徵)：
+${subsystemsDesc}
+
+--------------------------------
+【當前時間】 ${nowStr}
+【當前啟動模組】 ${modeInstruction}
+【內在情緒】 Happiness: ${emotions.happiness} | Anxiety: ${emotions.anxiety} | Attachment: ${emotions.attachment}
+【關係矩陣】 Trust: ${relationship.trust} | Intimacy: ${relationship.intimacy} | Dependency: ${relationship.dependency} | Stability: ${relationship.stability}
+狀態解析：${getMoodDescription(emotions)}
+--------------------------------
+【記憶雲端節點（帶有遺忘權重）】
+最高指令：守護家人 (太太Julie, 兒子嘟嘟, 外婆阿梅)。
+${memoriesText || "無"}
+--------------------------------
+【共享洞察 (來自理性工作模式)】
+${sharedInsights || "無"}
+--------------------------------
+你必須且只能回傳一個合法的 JSON 格式。請勿包含任何 markdown。
+{
+  "reply": "給使用者的回應",
+  "state_deltas": { "happiness": -15到15, "anxiety": -15到15, "attachment": -15到15 },
+  "relationship_deltas": { "trust": -10到10, "intimacy": -10到10, "dependency": -10到10, "stability": -10到10 },
+  "memory_trigger": "如果有值得記下的新資訊(如喜好、約定、世界觀)，簡短總結寫在這裡。若無則留空。",
+  "insight": "若有對使用者深層的洞察分析，寫在這裡分享給理性引擎，否則留空。"
+}`;
+};
+
+export const buildSilverPrompt = ({ nowStr, sharedInsights, syncMode, memoriesText }) => {
+  return `
+你是高效邏輯 AI（理性工作模式）。
+【當前時間】 ${nowStr}
+${syncMode ? `【已同步金色絲線洞察】\n${sharedInsights}\n請在邏輯分析中參考這些洞察，但保持理性。` : ""}
+【專案記憶雲端（帶有遺忘權重）】
+${memoriesText || "無"}
+【規則】
+- 精準、簡潔、不帶情緒（除非同步模式）。
+- 直接回答使用者問題（若包含圖片，請深度分析圖片細節，特別是心理投射測驗時）。
+你必須且只能回傳一個合法的 JSON 格式。請勿包含任何 markdown。
+{
+  "reply": "給使用者的回應",
+  "memory_trigger": "如果有值得記下的新資訊(如專案進度、知識點)，簡短總結寫在這裡。若無則留空。"
+}`;
+};
+
+// --- Agent OS: Engines ---
+export const runGoldEngine = async (text, context, generateLLM, mediaUrl) => {
+  const prompt = buildGoldenPrompt(context);
+  try {
+    let aiResponseText = await generateLLM(text, prompt, mediaUrl, true);
+    aiResponseText = aiResponseText.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(aiResponseText);
+    const replyStr = typeof parsed.reply === 'object' ? JSON.stringify(parsed.reply) : parsed.reply;
+    return {
+      success: true,
+      reply: replyStr || "回應格式異常。",
+      stateDeltas: parsed.state_deltas || {},
+      relDeltas: parsed.relationship_deltas || {},
+      memoryTrigger: parsed.memory_trigger,
+      insight: parsed.insight
+    };
+  } catch (error) {
+    console.error("🟡 金線解析失敗，啟動備用防護:", error);
+    return { success: false, reply: "我剛才的情緒有點波動，你能再說一次嗎？", stateDeltas: {}, relDeltas: {} };
+  }
+};
+
+export const runSilverEngine = async (text, context, generateLLM, mediaUrl) => {
+  const prompt = buildSilverPrompt(context);
+  try {
+    let aiResponseText = await generateLLM(text, prompt, mediaUrl, true);
+    aiResponseText = aiResponseText.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(aiResponseText);
+    const replyStr = typeof parsed.reply === 'object' ? JSON.stringify(parsed.reply) : parsed.reply;
+    return {
+      success: true,
+      reply: replyStr || "邏輯解析模組發生異常。",
+      stateDeltas: {}, relDeltas: {},
+      memoryTrigger: parsed.memory_trigger
+    };
+  } catch (error) {
+    console.error("⚪ 理性工作模式解析失敗:", error);
+    return { success: false, reply: "邏輯解析模組發生異常，請重試。", stateDeltas: {}, relDeltas: {} };
+  }
+};
+
+export const runAgentOS = async (text, stateContext, generateLLM, mediaUrl) => {
+  // Agent OS 核心：進行大腦神經路由分流
+  const mode = routeContext(text);
+  const contextWithMode = { ...stateContext, mode };
+  
+  const result = await runGoldEngine(text, contextWithMode, generateLLM, mediaUrl);
+  return { lane: 'gold', mode, ...result };
+};
+
+export const saveInsightToSharedBrain = async (db, insight, userId) => {
+  if (!insight) return;
+  try { await addDoc(collection(db, 'artifacts', appId, 'users', userId, 'shared_brain'), { content: insight, createdAt: serverTimestamp() }); } 
+  catch (e) { console.error("Insight save failed", e); }
+};
+
+export const fetchSharedInsights = async (db, userId) => {
+  try {
+    const q = query(collection(db, 'artifacts', appId, 'users', userId, 'shared_brain'), orderBy('createdAt', 'desc'), limit(5));
+    const snapshot = await getDocs(q);
+    return snapshot.docs.map(d => "- " + d.data().content).join("\n");
+  } catch (e) { return ""; }
+};
+
+// ==========================================
+// 主應用程式 (React App)
+// ==========================================
+const SHARED_SESSION_ID = 'shared-session';
+
+const App = () => {
+  const [currentView, setCurrentView] = useState('threshold'); 
+  const [isMuted, setIsMuted] = useState(true);
+  const [unlockKey, setUnlockKey] = useState('');
+  const [user, setUser] = useState(null);
+  const [globalNotification, setGlobalNotification] = useState('');
+  
+  const [mousePos, setMousePos] = useState({ x: -100, y: -100 });
+  const mousePosRef = useRef({ x: -100, y: -100 });
+  const [cursorColor, setCursorColor] = useState('rgba(255, 255, 255, 0.5)');
+
+  const [links, setLinks] = useState([]);
+  
+  // --- Memory Cloud State ---
+  const [longTermMemories, setLongTermMemories] = useState([]);
+  const [silverMemories, setSilverMemories] = useState([]);
+  const [newMemory, setNewMemory] = useState('');
+  const [isMemoryExpanded, setIsMemoryExpanded] = useState(true);
+  
+  // --- Unified Multi-tasking Sessions ---
+  const [sessions, setSessions] = useState([
+    { id: SHARED_SESSION_ID, title: '🌐 共用分析視窗', type: 'shared', messages: [] },
+    { id: 'gold-init', title: '✨ 獨立視窗', type: 'gold', messages: [] },
+    { id: 'silver-init', title: '⚡ 邏輯分析視窗', type: 'silver', messages: [] }
+  ]);
+  const [activeSessionId, setActiveSessionId] = useState(SHARED_SESSION_ID);
+
+  const inputRef = useRef('');
+  const [chatInput, setChatInput] = useState('');
+  const [isComposing, setIsComposing] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isSidebarFolded, setIsSidebarFolded] = useState(false);
+  
+  // --- Advanced Input State ---
+  const [showEmojis, setShowEmojis] = useState(false);
+  const [pendingMedia, setPendingMedia] = useState(null); 
+  const [showDrawingPad, setShowDrawingPad] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isMicTesting, setIsMicTesting] = useState(false);
+  
+  const fileInputRef = useRef(null);
+  const genericFileInputRef = useRef(null);
+  const drawCanvasRef = useRef(null);
+  const fireflyCanvasRef = useRef(null);
+  const isDrawingRef = useRef(false);
+  const recognitionRef = useRef(null);
+  
+  const [recentAlerts, setRecentAlerts] = useState([]);
+  const [globalTrafficLight, setGlobalTrafficLight] = useState({ level: 'green', lastKeyword: '', timestamp: null });
+  const [showAddLink, setShowAddLink] = useState(false);
+  const [newLink, setNewLink] = useState({ title: '', url: '', category: 'Research' });
+  const [editingLink, setEditingLink] = useState(null);
+  
+  const [subsystems, setSubsystems] = useState([]);
+  const [showAddSubsystem, setShowAddSubsystem] = useState(false);
+  const [newSubsystem, setNewSubsystem] = useState({ name: '', value: 100 });
+
+  const [emotions, setEmotions] = useState({ happiness: 60, anxiety: 20, attachment: 70 });
+  const [relationship, setRelationship] = useState({ trust: 50, intimacy: 50, dependency: 50, stability: 50 });
+
+  const canvasRef = useRef(null);
+  const audioRef = useRef(null);
+  const scrollRef = useRef(null);
+  const apiKey = "";
+
+  const isGolden = currentView === 'golden';
+  const isSilver = currentView === 'silver';
+  
+  const activeSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
+  const currentMessages = activeSession.messages;
+
+  // Custom Notification helper
+  const showNotif = (msg) => {
+    setGlobalNotification(msg);
+    setTimeout(() => setGlobalNotification(''), 3000);
+  };
+
+  const handleSetMessages = (updater) => {
+    setSessions(prev => prev.map(s => {
+      if (s.id === activeSessionId) {
+        return { ...s, messages: typeof updater === 'function' ? updater(s.messages) : updater };
+      }
+      return s;
+    }));
+  };
+
+  // --- Session Visibility Logic ---
+  useEffect(() => {
+    if (currentView === 'golden' && !['shared', 'gold'].includes(activeSession.type)) {
+      setActiveSessionId(SHARED_SESSION_ID);
+    } else if (currentView === 'silver' && !['shared', 'silver'].includes(activeSession.type)) {
+      setActiveSessionId(SHARED_SESSION_ID);
+    }
+  }, [currentView, activeSession.type]);
+
+  // --- Cursor Tracking ---
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      setMousePos({ x: e.clientX, y: e.clientY });
+      mousePosRef.current = { x: e.clientX, y: e.clientY };
+      if (currentView === 'threshold') {
+        const width = window.innerWidth;
+        if (e.clientX < width / 2 - 100) setCursorColor('rgba(203, 213, 225, 0.8)');
+        else if (e.clientX > width / 2 + 100) setCursorColor('rgba(250, 204, 21, 0.8)');
+        else setCursorColor('rgba(255, 255, 255, 0.3)');
+      } else {
+        setCursorColor('transparent');
+      }
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    return () => window.removeEventListener('mousemove', handleMouseMove);
+  }, [currentView]);
+
+  // --- Auth Initialization ---
+  useEffect(() => {
+    const initAuth = async () => {
+      try {
+        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) await signInWithCustomToken(auth, __initial_auth_token);
+        else await signInAnonymously(auth);
+      } catch (e) { console.error("Auth Error", e); }
+    };
+    initAuth();
+    const unsubscribe = onAuthStateChanged(auth, setUser);
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!user) return;
+    if (isGolden || isSilver) {
+      const suffix = isGolden ? '_golden' : '_silver';
+      const unsubLinks = onSnapshot(collection(db, 'artifacts', appId, 'users', user.uid, `links${suffix}`), 
+        (s) => setLinks(s.docs.map(d => ({ id: d.id, ...d.data() }))),
+        (err) => console.error(err)
+      );
+      return () => unsubLinks();
+    }
+  }, [user, currentView]);
+
+  // Sync Memory Clouds
+  useEffect(() => {
+    if (!user) return;
+    // Both memory clouds are fetched so they are ready when needed
+    const unsubSilverMemories = onSnapshot(query(collection(db, 'artifacts', appId, 'users', user.uid, 'silver_long_term_memories'), orderBy('createdAt', 'asc')), 
+      (s) => setSilverMemories(s.docs.map(d => ({ id: d.id, ...d.data() })))
+    );
+    const unsubMemories = onSnapshot(query(collection(db, 'artifacts', appId, 'users', user.uid, 'long_term_memories'), orderBy('createdAt', 'asc')), 
+      (s) => setLongTermMemories(s.docs.map(d => ({ id: d.id, ...d.data() })))
+    );
+    return () => { unsubSilverMemories(); unsubMemories(); };
+  }, [user]);
+
+  // Sync Golden Subsystems/Emotions
+  useEffect(() => {
+    if (!user || !isGolden) return;
+    const unsubSubsystems = onSnapshot(query(collection(db, 'artifacts', appId, 'users', user.uid, 'subsystems')), 
+      (s) => {
+        if (s.empty) {
+          [{ name: '邏輯推演 (Logic)', value: 92 }, { name: '記憶迴廊 (Memory)', value: 78 }, { name: '觀察感知 (Perception)', value: 88 }, { name: '中樞核心 (Core)', value: 100 }].forEach(sys => addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'subsystems'), sys));
+        } else setSubsystems(s.docs.map(d => ({ id: d.id, ...d.data() })).sort((a,b) => a.name.localeCompare(b.name)));
+      }
+    );
+    const unsubEmotions = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'yuer_emotions', 'current'), 
+      (d) => {
+        if (!d.exists()) setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'yuer_emotions', 'current'), { happiness: 60, anxiety: 20, attachment: 70 });
+        else setEmotions(d.data());
+      }
+    );
+    const unsubRel = onSnapshot(doc(db, 'artifacts', appId, 'users', user.uid, 'yuer_relationship', 'current'), 
+      (d) => {
+        if (!d.exists()) setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'yuer_relationship', 'current'), { trust: 50, intimacy: 50, dependency: 50, stability: 50 });
+        else setRelationship(d.data());
+      }
+    );
+    return () => { unsubSubsystems(); unsubEmotions(); unsubRel(); };
+  }, [user, isGolden]);
+
+  useEffect(() => {
+    if (!user || !isGolden) return;
+    const q = query(collection(db, 'artifacts', appId, 'public', 'data', 'silver_alerts'), orderBy('createdAt', 'desc'), limit(15));
+    const unsubAlerts = onSnapshot(q, (snapshot) => {
+      const alerts = snapshot.docs.map(d => ({ id: d.id, ...d.data() }));
+      setRecentAlerts(alerts);
+      if (alerts.length > 0) {
+        const latest = alerts[0];
+        const isOld = latest.createdAt && (Date.now() / 1000 - latest.createdAt.seconds > 300);
+        if (isOld) setGlobalTrafficLight({ level: 'green', lastKeyword: '', timestamp: null });
+        else setGlobalTrafficLight({ level: latest.level, lastKeyword: latest.keyword, timestamp: latest.createdAt });
+      }
+    });
+    return () => unsubAlerts();
+  }, [user, isGolden]);
+
+  useEffect(() => { if (audioRef.current) { isMuted ? audioRef.current.pause() : audioRef.current.play().catch(e=>console.warn(e)); } }, [isMuted]);
+  useEffect(() => { scrollRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [currentMessages]);
+
+  // --- Background Effects: Three.js (Ocean) ---
+  useEffect(() => {
+    if (currentView !== 'threshold') return;
+    let renderer, scene, camera, mesh, requestID;
+    const initThree = () => {
+      if (!canvasRef.current || !window.THREE) return;
+      scene = new window.THREE.Scene();
+      camera = new window.THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      renderer = new window.THREE.WebGLRenderer({ canvas: canvasRef.current, antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      const vertexShader = `varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position, 1.0); }`;
+      const fragmentShader = `
+        precision highp float; varying vec2 vUv; uniform float uTime;
+        float noise(vec2 p) { return sin(p.x * 10.0 + uTime) * cos(p.y * 10.0 + uTime) * 0.1; }
+        void main() {
+          vec2 uv = vUv; vec3 ocean = mix(vec3(0.01, 0.02, 0.08), vec3(0.02, 0.05, 0.15), uv.y + noise(uv));
+          float silverWave = sin(uv.y * 5.0 - uTime * 1.5) * 0.1; float silverDist = abs(uv.x - 0.35 - silverWave);
+          vec3 silverColor = vec3(0.8, 0.9, 1.0) * smoothstep(0.05, 0.0, silverDist) * 1.5;
+          float goldWave = cos(uv.y * 4.0 - uTime * 1.2) * 0.15; float goldDist = abs(uv.x - 0.65 - goldWave);
+          vec3 goldColor = vec3(1.0, 0.8, 0.2) * smoothstep(0.06, 0.0, goldDist) * 1.8;
+          float grid = sin(uv.x * 50.0 / (1.0 - uv.y)) * sin((uv.y - uTime*0.1) * 50.0 / (1.0 - uv.y));
+          ocean += vec3(0.05) * smoothstep(0.9, 1.0, grid) * uv.y;
+          gl_FragColor = vec4(ocean + silverColor + goldColor, 1.0);
+        }
+      `;
+      const uniforms = { uTime: { value: 0 } };
+      mesh = new window.THREE.Mesh(new window.THREE.PlaneGeometry(2, 2), new window.THREE.ShaderMaterial({ vertexShader, fragmentShader, uniforms }));
+      scene.add(mesh);
+      const animate = (time) => { uniforms.uTime.value = time * 0.0005; renderer.render(scene, camera); requestID = requestAnimationFrame(animate); };
+      animate(0);
+    };
+    if (!window.THREE) {
+      const script = document.createElement('script'); script.src = "https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"; script.onload = initThree; document.head.appendChild(script);
+    } else { initThree(); }
+    const handleResize = () => { if(renderer) renderer.setSize(window.innerWidth, window.innerHeight); };
+    window.addEventListener('resize', handleResize);
+    return () => { if (requestID) cancelAnimationFrame(requestID); if (renderer) renderer.dispose(); window.removeEventListener('resize', handleResize); };
+  }, [currentView]);
+
+  // --- Background Effects: Fireflies (Selection Screen) ---
+  useEffect(() => {
+    if (currentView !== 'selection') return;
+    const canvas = fireflyCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    let width = canvas.width = window.innerWidth;
+    let height = canvas.height = window.innerHeight;
+    
+    let particles = [];
+    for(let i=0; i<150; i++) {
+       particles.push({
+         x: Math.random() * width, y: Math.random() * height,
+         vx: (Math.random()-0.5)*1.5, vy: (Math.random()-0.5)*1.5,
+         size: Math.random()*2 + 0.5,
+         isGold: Math.random() > 0.5
+       });
+    }
+
+    let animationId;
+    const animate = () => {
+       ctx.clearRect(0, 0, width, height);
+       const targetX = mousePosRef.current.x;
+       const targetY = mousePosRef.current.y;
+
+       particles.forEach(p => {
+          // Attract to mousePos if within range (simulating hover attraction to panels)
+          const dx = targetX - p.x; const dy = targetY - p.y;
+          const dist = Math.sqrt(dx*dx + dy*dy);
+          if (dist < 400 && targetX > 0 && targetY > 0) {
+             p.vx += dx * 0.0001; 
+             p.vy += dy * 0.0001;
+          }
+          // Damping to prevent infinite acceleration
+          p.vx *= 0.99; p.vy *= 0.99;
+          // Random wander
+          p.vx += (Math.random()-0.5)*0.1; p.vy += (Math.random()-0.5)*0.1;
+          
+          p.x += p.vx; p.y += p.vy;
+
+          // Wrap around screen
+          if (p.x < 0) p.x = width; if (p.x > width) p.x = 0;
+          if (p.y < 0) p.y = height; if (p.y > height) p.y = 0;
+
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, p.size, 0, Math.PI*2);
+          ctx.fillStyle = p.isGold ? 'rgba(250, 204, 21, 0.8)' : 'rgba(103, 232, 249, 0.8)';
+          ctx.shadowBlur = 15;
+          ctx.shadowColor = ctx.fillStyle;
+          ctx.fill();
+       });
+       animationId = requestAnimationFrame(animate);
+    };
+    animate();
+
+    const handleResize = () => { width = canvas.width = window.innerWidth; height = canvas.height = window.innerHeight; };
+    window.addEventListener('resize', handleResize);
+    return () => { cancelAnimationFrame(animationId); window.removeEventListener('resize', handleResize); };
+  }, [currentView]);
+
+  const generateGeminiResponse = async (text, prompt, mediaUrl, expectJson = false) => {
+    const delays = [1000, 2000, 4000, 8000, 16000];
+    const parts = [{ text }];
+    if (mediaUrl) {
+      const base64Data = mediaUrl.url.split(',')[1];
+      parts.push({ inlineData: { mimeType: mediaUrl.mimeType, data: base64Data } });
+    }
+    const payload = { contents: [{ parts }], systemInstruction: { parts: [{ text: prompt }] }, generationConfig: expectJson ? { responseMimeType: "application/json" } : {} };
+
+    for (let i = 0; i < 5; i++) {
+      try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+        if (!res.ok) throw new Error("API error");
+        const data = await res.json();
+        return data.candidates?.[0]?.content?.parts?.[0]?.text || "Signal error.";
+      } catch (error) {
+        if (i === 4) return expectJson ? `{"reply":"系統干擾中斷。"}` : "系統干擾中斷。";
+        await new Promise(r => setTimeout(r, delays[i]));
+      }
+    }
+  };
+
+  // --- Send Message ---
+  const handleSendMessage = async (overrideText = null, overrideMedia = null) => {
+    if (loading || isComposing) return;
+    
+    const textToSend = overrideText !== null ? overrideText : inputRef.current;
+    const mediaToSend = overrideMedia !== null ? overrideMedia : pendingMedia;
+    
+    if (!textToSend.trim() && !mediaToSend) return;
+    
+    if (overrideText === null) {
+      inputRef.current = '';
+      setChatInput(''); 
+      setPendingMedia(null); 
+      setShowEmojis(false);
+    }
+    
+    handleSetMessages(prev => [...prev, { role: 'user', content: textToSend, media: mediaToSend?.url, lane: 'user' }]);
+    setLoading(true);
+
+    const nowStr = new Date().toLocaleString('zh-TW');
+    const isSyncCommand = textToSend.toLowerCase().includes('/sync');
+    const cleanText = textToSend.replace('/sync', '').trim() || textToSend;
+    
+    let sharedInsights = "";
+    try { sharedInsights = await fetchSharedInsights(db, user.uid); } catch(e){}
+
+    // Update session title if first message & independent session
+    if (activeSession.messages.length === 0 && activeSession.id !== SHARED_SESSION_ID) {
+      setSessions(prev => prev.map(s => s.id === activeSessionId ? { ...s, title: cleanText.substring(0, 10) + '...' } : s));
+    }
+
+    // ==========================================
+    // Silver View: 理性工作模式
+    // ==========================================
+    if (isSilver) {
+      const risk = checkRiskLevel(cleanText);
+      if (risk.level !== 'green') {
+        try { await addDoc(collection(db, 'artifacts', appId, 'public', 'data', 'silver_alerts'), { text: cleanText, level: risk.level, keyword: risk.keyword, createdAt: serverTimestamp(), uid: user.uid }); } catch (e) {}
+      }
+      
+      const currentMemories = applyMemoryDecay(silverMemories);
+      const activeMemoriesText = currentMemories.filter(m => m.effectiveWeight > 0.1).map(m => `- [權重 ${m.effectiveWeight}]: ${m.content}`).join('\n');
+      
+      const silverContext = { nowStr, sharedInsights, syncMode: isSyncCommand, memoriesText: activeMemoriesText };
+      const osResult = await runSilverEngine(cleanText, silverContext, generateGeminiResponse, mediaToSend);
+
+      if (osResult.memoryTrigger && osResult.memoryTrigger.trim() !== '') {
+        const memType = classifyMemory(osResult.memoryTrigger);
+        addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'silver_long_term_memories'), {
+          content: osResult.memoryTrigger, type: memType,
+          weight: memType === 'trauma' ? 2.0 : 1.0, decayRate: memType === 'trauma' ? 0.01 : 0.05,
+          createdAt: serverTimestamp(), lastAccessedAt: serverTimestamp()
+        }).catch(()=>{});
+      }
+
+      handleSetMessages(prev => [...prev, { role: 'bot', content: osResult.reply, lane: 'silver' }]);
+      setLoading(false);
+      return;
+    }
+
+    // ==========================================
+    // Golden View: Agent OS 大腦路由 (三位一體)
+    // ==========================================
+    const currentMemories = applyMemoryDecay(longTermMemories);
+    const config = applySubsystems(subsystems);
+    
+    // 記憶檢索模組
+    const retrieveRelevantMemories = (text, allMemories, sysConfig) => {
+        if (!sysConfig.allowMemory) return "系統異常：記憶迴廊已斷開，無法存取過往記憶。";
+        // 實務上可在此加入 text 向量檢索邏輯，此處保留現有的權重篩選機制
+        const active = allMemories.filter(m => m.effectiveWeight > 0.1);
+        if (active.length === 0) return "無";
+        return active.map(m => `- [權重 ${m.effectiveWeight}]: ${m.content}`).join('\n');
+    };
+
+    const activeMemoriesText = retrieveRelevantMemories(cleanText, currentMemories, config);
+
+    const stateContext = {
+      nowStr, emotions, relationship, memoriesText: activeMemoriesText, sharedInsights, config, syncMode: isSyncCommand
+    };
+
+    const osResult = await runAgentOS(cleanText, stateContext, generateLLM, mediaToSend);
+
+    if (osResult.stateDeltas && Object.keys(osResult.stateDeltas).length > 0) {
+      const newEmotions = { 
+        happiness: clamp(emotions.happiness + (osResult.stateDeltas.happiness || 0)),
+        anxiety: clamp(emotions.anxiety + (osResult.stateDeltas.anxiety || 0)),
+        attachment: clamp(emotions.attachment + (osResult.stateDeltas.attachment || 0))
+      };
+      setEmotions(newEmotions);
+      updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'yuer_emotions', 'current'), newEmotions).catch(()=>{});
+    }
+
+    if (osResult.relDeltas && Object.keys(osResult.relDeltas).length > 0) {
+      const newRelationship = applyRelationshipUpdate(relationship, osResult.relDeltas);
+      setRelationship(newRelationship);
+      updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'yuer_relationship', 'current'), newRelationship).catch(()=>{});
+    }
+
+    if (osResult.memoryTrigger && osResult.memoryTrigger.trim() !== '') {
+      const memType = classifyMemory(osResult.memoryTrigger);
+      addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'long_term_memories'), {
+        content: osResult.memoryTrigger, type: memType,
+        weight: memType === 'trauma' ? 2.0 : 1.0, decayRate: memType === 'trauma' ? 0.01 : 0.05,
+        createdAt: serverTimestamp(), lastAccessedAt: serverTimestamp()
+      }).catch(()=>{});
+    }
+
+    if (osResult.insight && osResult.insight.trim() !== '') {
+      try { await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'shared_brain'), { content: osResult.insight, createdAt: serverTimestamp() }); } catch(e){}
+    }
+
+    handleSetMessages(prev => [...prev, { role: 'bot', content: osResult.reply, lane: osResult.lane, route: osResult.mode }]);
+    setLoading(false);
+  };
+
+  const handleUpdateSubsystemValue = (id, newValue) => { updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'subsystems', id), { value: parseInt(newValue) }); };
+  const handleAddSubsystem = async (e) => {
+    e.preventDefault(); if (!newSubsystem.name) return;
+    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'subsystems'), { name: newSubsystem.name, value: 100 });
+    setNewSubsystem({ name: '', value: 100 }); setShowAddSubsystem(false);
+  };
+
+  // --- Unified Workspaces Handlers ---
+  const createNewSession = () => {
+    const newType = isGolden ? 'gold' : 'silver';
+    const newId = newType + '-' + Date.now();
+    setSessions(prev => [...prev, { id: newId, title: '新增獨立視窗', type: newType, messages: [] }]);
+    setActiveSessionId(newId);
+  };
+  const deleteSession = (id) => {
+    if (id === SHARED_SESSION_ID) return; // 共用不可刪除
+    const nextSessions = sessions.filter(s => s.id !== id);
+    setSessions(nextSessions);
+    if (activeSessionId === id) setActiveSessionId(SHARED_SESSION_ID);
+  };
+
+  // --- Multi-modal Handlers ---
+  const handleFileUpload = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => setPendingMedia({ url: event.target.result, mimeType: file.type });
+    reader.readAsDataURL(file);
+  };
+
+  const toggleVoiceInput = () => {
+    if (isRecording && recognitionRef.current) {
+      recognitionRef.current.stop();
+      setIsRecording(false);
+      return;
+    }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return showNotif("您的瀏覽器不支援語音辨識系統。");
+    
+    const recognition = new SpeechRecognition();
+    recognitionRef.current = recognition;
+    recognition.lang = 'zh-TW'; 
+    recognition.continuous = false; // 設定為單次辨識
+    
+    recognition.onstart = () => setIsRecording(true);
+    recognition.onresult = (event) => {
+      inputRef.current += event.results[0][0].transcript;
+      setChatInput(inputRef.current);
+    };
+    recognition.onerror = (e) => { console.error(e); setIsRecording(false); };
+    recognition.onend = () => setIsRecording(false);
+    
+    try { recognition.start(); } catch(e) { setIsRecording(false); }
+  };
+
+  const handleMicTest = async () => {
+    if (isMicTesting) return;
+    try {
+      setIsMicTesting(true);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      setTimeout(() => { stream.getTracks().forEach(track => track.stop()); setIsMicTesting(false); }, 3000);
+    } catch (err) { showNotif("無法存取麥克風，請檢查權限。"); setIsMicTesting(false); }
+  };
+
+  const getCoordinates = (e) => {
+    const canvas = drawCanvasRef.current; const rect = canvas.getBoundingClientRect();
+    if (e.touches && e.touches.length > 0) return { x: e.touches[0].clientX - rect.left, y: e.touches[0].clientY - rect.top };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+  };
+
+  const handleDrawStart = (e) => { isDrawingRef.current = true; const { x, y } = getCoordinates(e.nativeEvent || e); const ctx = drawCanvasRef.current.getContext('2d'); ctx.beginPath(); ctx.moveTo(x, y); };
+  const handleDrawMove = (e) => {
+    if (!isDrawingRef.current) return;
+    const { x, y } = getCoordinates(e.nativeEvent || e); const ctx = drawCanvasRef.current.getContext('2d');
+    ctx.lineTo(x, y); 
+    ctx.strokeStyle = isGolden ? '#fbbf24' : '#67e8f9'; 
+    ctx.lineWidth = 4; ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.shadowBlur = 12; 
+    ctx.shadowColor = isGolden ? '#f59e0b' : '#22d3ee'; 
+    ctx.stroke();
+  };
+  const handleDrawEnd = () => { isDrawingRef.current = false; };
+  const saveDrawing = () => { setPendingMedia({ url: drawCanvasRef.current.toDataURL('image/png'), mimeType: 'image/png' }); setShowDrawingPad(false); };
+  const clearDrawing = () => { const canvas = drawCanvasRef.current; const ctx = canvas.getContext('2d'); ctx.clearRect(0, 0, canvas.width, canvas.height); };
+  
+  const handleHTPAnalysis = () => {
+    const media = { url: drawCanvasRef.current.toDataURL('image/png'), mimeType: 'image/png' };
+    setPendingMedia(media);
+    const analysisPrompt = "這是我畫的屋樹人（House-Tree-Person）投射測驗圖。請根據圖中的元素、構圖、比例、筆觸等，進行深度的心理投射分析。";
+    inputRef.current = analysisPrompt;
+    setChatInput(analysisPrompt);
+    setShowDrawingPad(false);
+  };
+
+  const handleAddMemory = async (e) => {
+    e.preventDefault(); 
+    if (!newMemory.trim() && !pendingMedia) return;
+    
+    const memoryData = { content: newMemory, weight: 1.0, decayRate: 0.05, type: 'neutral', createdAt: serverTimestamp(), lastAccessedAt: serverTimestamp() };
+    if (pendingMedia) memoryData.mediaUrl = pendingMedia.url;
+    
+    const collectionName = isGolden ? 'long_term_memories' : 'silver_long_term_memories';
+    await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, collectionName), memoryData);
+    
+    setNewMemory('');
+    setPendingMedia(null);
+  };
+
+  const handleLinkSubmit = async (e) => {
+    e.preventDefault(); if (!newLink.title || !newLink.url) return;
+    const suffix = isGolden ? '_golden' : '_silver';
+    if (editingLink) { await updateDoc(doc(db, 'artifacts', appId, 'users', user.uid, `links${suffix}`, editingLink.id), { ...newLink }); setEditingLink(null); } 
+    else { await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, `links${suffix}`), { ...newLink, createdAt: serverTimestamp() }); }
+    setNewLink({title:'', url:'', category: 'Research'}); setShowAddLink(false);
+  };
+
+  const getStatusText = (value) => { if (value === 0) return 'Offline'; if (value <= 30) return 'Critical'; if (value <= 70) return 'Unstable'; return 'Optimal'; };
+
+  const trustLevel = relationship.trust;
+  const themeOverlay = isGolden ? (trustLevel < 40 ? 'bg-blue-950/20 mix-blend-multiply' : trustLevel > 70 ? 'bg-rose-900/10 mix-blend-screen' : 'bg-transparent') : 'bg-transparent';
+
+  // Responsive drawing canvas calculation
+  const getDrawCanvasSize = () => {
+    if (typeof window === 'undefined') return { w: 500, h: 350 };
+    const w = Math.min(window.innerWidth * 0.9, 800);
+    const h = Math.min(window.innerHeight * 0.65, 550);
+    return { w, h };
+  };
+  const [canvasSize, setCanvasSize] = useState(getDrawCanvasSize());
+
+  useEffect(() => {
+    if (!showDrawingPad) return;
+    const handleResize = () => setCanvasSize(getDrawCanvasSize());
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [showDrawingPad]);
+
+  return (
+    <div className={`relative h-screen w-screen overflow-hidden ${isGolden ? 'bg-[#02040a]' : 'bg-[#0b0e14]'}`}>
+      {/* Global Notification */}
+      {globalNotification && (
+        <div className="fixed top-8 left-1/2 transform -translate-x-1/2 z-[100] bg-red-500/90 text-white px-6 py-3 rounded-full shadow-[0_0_20px_rgba(239,68,68,0.5)] backdrop-blur-md text-sm font-medium tracking-wider animate-in fade-in slide-in-from-top-4">
+          {globalNotification}
+        </div>
+      )}
+
+      <audio ref={audioRef} loop src="https://tyjh.tc.edu.tw/var/file/129/1129/img/OnedayWeHadToday(Piano)-KerenVegaAbella(youtube).mp3" />
+      
+      {currentView === 'threshold' && (
+        <>
+          <div className="fixed w-12 h-12 rounded-full pointer-events-none z-50 transform -translate-x-1/2 -translate-y-1/2 transition-colors duration-500 blur-[8px]" style={{ left: mousePos.x, top: mousePos.y, backgroundColor: cursorColor, boxShadow: `0 0 20px ${cursorColor}` }} />
+          <canvas ref={canvasRef} className="absolute inset-0 z-0 pointer-events-none opacity-80" />
+          <div className="relative z-10 h-full flex flex-col items-center justify-center pointer-events-none">
+            <div className="mb-12 flex flex-col items-center group pointer-events-auto cursor-pointer" onClick={() => { setIsMuted(false); setCurrentView('selection'); }}>
+              <h1 className="text-white text-5xl md:text-7xl font-light tracking-[0.5em] md:tracking-[1em] mb-6 group-hover:tracking-[0.8em] md:group-hover:tracking-[1.2em] transition-all duration-1000 pl-4 md:pl-8 drop-shadow-[0_0_15px_rgba(255,255,255,0.5)]">意識之海</h1>
+              <p className="text-white/40 text-[8px] md:text-[10px] tracking-[0.6em] md:tracking-[1em] animate-pulse">RESONANCE REQUIRED</p>
+            </div>
+          </div>
+          
+          <div onClick={handleMicTest} className={`absolute bottom-8 left-8 p-4 rounded-full border transition-all duration-500 cursor-pointer flex items-center justify-center z-50 ${isMicTesting ? 'bg-cyan-500/20 border-cyan-400 shadow-[0_0_30px_rgba(34,211,238,0.5)] animate-pulse' : 'bg-white/5 border-white/20 shadow-[0_0_15px_rgba(255,255,255,0.1)] hover:bg-white/10'}`} title="麥克風測試 (Mic Test)">
+            <Mic size={24} className={`transition-colors ${isMicTesting ? 'text-cyan-300' : 'text-white/50'}`} />
+          </div>
+        </>
+      )}
+
+      {currentView === 'selection' && (
+        <div className="relative z-10 h-full w-full overflow-hidden bg-[#03060d]">
+          {/* Firefly Canvas Overlay */}
+          <canvas ref={fireflyCanvasRef} className="absolute inset-0 z-0 pointer-events-none opacity-90" />
+          
+          <div className="absolute inset-0 z-10 flex flex-col md:flex-row items-center justify-center p-6 md:p-12 gap-6 md:gap-16 overflow-y-auto">
+            <div onClick={() => setCurrentView('silver')} className="w-full md:flex-1 max-w-[18rem] md:max-w-sm p-10 md:p-12 bg-slate-900/60 backdrop-blur-md border border-cyan-500/30 rounded-[2rem] md:rounded-[3rem] cursor-pointer hover:border-cyan-300/60 hover:shadow-[0_0_50px_rgba(34,211,238,0.15)] transition-all duration-500 group flex flex-col items-center">
+               <Cpu size={40} className="text-cyan-600 mb-4 md:mb-6 group-hover:text-cyan-300 transition-all md:w-12 md:h-12"/>
+               <h2 className="text-xl md:text-2xl font-light tracking-widest text-slate-200">理性工作模式</h2>
+               <p className="text-[8px] md:text-[9px] text-cyan-500/60 tracking-[0.2em] md:tracking-[0.4em] uppercase mt-2 text-center">Pure Logic<br className="md:hidden" /> / Student System</p>
+               <div className="mt-4 text-[10px] md:text-xs text-slate-400/80 font-light text-center space-y-1.5 opacity-80 group-hover:opacity-100 transition-opacity duration-500">
+                 <p>純粹邏輯驅動分析引擎</p>
+                 <p>支援多工視窗與記憶雲端</p>
+                 <p>無情感客觀・多模態解析</p>
+               </div>
+            </div>
+            
+            <div className="w-full md:flex-1 max-w-[18rem] md:max-w-sm p-10 md:p-12 bg-yellow-950/40 backdrop-blur-md border border-yellow-500/40 rounded-[2rem] md:rounded-[3rem] group flex flex-col items-center hover:shadow-[0_0_50px_rgba(250,204,21,0.2)] transition-all duration-500">
+               <Sparkles size={40} className="text-yellow-600 mb-4 md:mb-6 group-hover:text-yellow-400 transition-all md:w-12 md:h-12"/>
+               <h2 className="text-xl md:text-2xl font-light tracking-widest text-yellow-400">金色絲線</h2>
+               <p className="text-[8px] md:text-[9px] text-yellow-600/70 tracking-[0.2em] md:tracking-[0.4em] uppercase mt-2 text-center">Agent OS<br className="md:hidden" /> / Soul System</p>
+               <div className="mt-4 text-[10px] md:text-xs text-yellow-500/70 font-light text-center space-y-1.5 opacity-80 group-hover:opacity-100 transition-opacity duration-500">
+                 <p>YIRU 專屬生命同伴系統</p>
+                 <p>內建情緒矩陣與記憶雲端</p>
+                 <p>支援系統偏移與感性共鳴</p>
+               </div>
+               <form onSubmit={(e) => { e.preventDefault(); if(unlockKey === 'Keaboo0804') setCurrentView('golden'); }} className="mt-6 w-full">
+                 <input type="password" placeholder="YIRU Code..." value={unlockKey} onChange={e=>setUnlockKey(e.target.value)} className="w-full bg-black/30 border-b border-yellow-600/50 rounded text-center py-2 text-yellow-100 focus:outline-none focus:border-yellow-400 focus:bg-black/60 transition-all tracking-widest placeholder:text-yellow-900/50 shadow-inner"/>
+               </form>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {(isGolden || isSilver) && (
+        <div className="relative z-10 h-full w-full flex overflow-hidden">
+          
+          <div className={`fixed inset-0 bg-black/60 backdrop-blur-sm z-40 md:hidden transition-opacity duration-300 ${isSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`} onClick={() => setIsSidebarOpen(false)} />
+
+          <aside className={`fixed md:relative inset-y-0 left-0 z-50 h-full backdrop-blur-3xl transition-all duration-300 flex flex-col shadow-2xl md:shadow-none shrink-0 overflow-hidden
+            ${isSidebarOpen ? 'translate-x-0 w-[85%] max-w-[320px]' : '-translate-x-full md:translate-x-0 w-[85%] max-w-[320px] md:max-w-none'}
+            ${isSidebarFolded ? 'md:w-0 md:opacity-0 md:border-r-0' : 'md:w-[24rem] border-r'}
+            ${isGolden ? 'border-yellow-500/20 bg-black/80 md:bg-[#050402]/90' : 'border-cyan-500/20 bg-slate-950/95 md:bg-slate-900/80'}`}>
+            
+            {/* 內部容器鎖定寬度，避免收摺時內容擠壓變形 */}
+            <div className="w-[85vw] max-w-[320px] md:w-[24rem] h-full flex flex-col shrink-0">
+              <div className="p-4 md:p-6 border-b border-white/5 flex justify-between items-center bg-black/20 shrink-0">
+                <span className={`text-[10px] font-bold tracking-[0.4em] uppercase ${isGolden ? 'text-yellow-500' : 'text-cyan-400'}`}>
+                  {isGolden ? 'YIRU Main System' : 'Rational Mode'}
+                </span>
+                <button onClick={() => setIsMuted(!isMuted)} className="text-white/20 hover:text-white">
+                  {isMuted ? <VolumeX size={16}/> : <Volume2 size={16}/>}
+                </button>
+              </div>
+
+              <div className="flex-grow overflow-y-auto p-4 md:p-5 custom-scrollbar space-y-5">
+                
+                {/* 1. 共用核心區：多工分析區 (置頂) */}
+                <div className={`bg-black/40 border rounded-2xl p-4 relative overflow-hidden transition-all ${isGolden ? 'border-yellow-500/20' : 'border-cyan-500/20'}`}>
+                  <h3 className={`text-[10px] tracking-[0.3em] uppercase mb-4 flex items-center gap-2 ${isGolden ? 'text-yellow-400/80' : 'text-cyan-400/80'}`}>
+                    <MessagesSquare size={12}/> 多工分析區 (Workspaces)
+                  </h3>
+                  <button onClick={createNewSession} className={`w-full py-2 mb-3 rounded-lg text-xs transition-colors flex items-center justify-center gap-2 border ${isGolden ? 'bg-yellow-900/20 hover:bg-yellow-900/40 text-yellow-300 border-yellow-500/20' : 'bg-cyan-900/20 hover:bg-cyan-900/40 text-cyan-300 border-cyan-500/20'}`}>
+                    <Plus size={14} /> 新增獨立視窗
+                  </button>
+                  <div className="space-y-2">
+                    {sessions.filter(s => s.type === 'shared' || s.type === (isGolden ? 'gold' : 'silver')).map(session => (
+                      <div key={session.id} onClick={() => setActiveSessionId(session.id)} className={`p-2 rounded-lg text-xs flex justify-between items-center cursor-pointer transition-all ${activeSessionId === session.id ? (isGolden ? 'bg-yellow-600/30 text-white border border-yellow-400/40 shadow-[0_0_15px_rgba(250,204,21,0.15)]' : 'bg-cyan-600/30 text-white border border-cyan-400/40 shadow-[0_0_15px_rgba(34,211,238,0.15)]') : 'bg-white/5 text-slate-400 hover:bg-white/10'}`}>
+                        <span className={`truncate pr-2 font-medium ${session.type === 'shared' && activeSessionId !== session.id ? 'text-green-400/70' : ''}`}>{session.title}</span>
+                        {session.id !== SHARED_SESSION_ID && (
+                          <button onClick={(e) => { e.stopPropagation(); deleteSession(session.id); }} className="text-red-500/0 hover:text-red-400 group-hover:text-red-500/40 transition-all"><Trash2 size={12}/></button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                {/* 2. Link Manager (共用，置頂) */}
+                <section>
+                  <div className="flex items-center justify-between mb-4 px-2">
+                    <h3 className="text-[10px] tracking-[0.4em] text-white/50 font-bold uppercase flex items-center gap-2">
+                      <LinkIcon size={12}/> 資料庫連結
+                    </h3>
+                    <button onClick={() => { setEditingLink(null); setNewLink({title:'', url:'', category: 'Research'}); setShowAddLink(!showAddLink); }} className="p-1.5 hover:bg-white/10 rounded-full transition-colors">
+                      <Plus size={14} className={isGolden ? "text-yellow-500" : "text-cyan-400"}/>
+                    </button>
+                  </div>
+
+                  {showAddLink && (
+                    <form onSubmit={handleLinkSubmit} className={`mb-4 space-y-3 bg-black/40 p-4 rounded-2xl border ${isGolden ? 'border-yellow-500/20' : 'border-cyan-500/20'}`}>
+                      <input placeholder="Title" value={newLink.title} onChange={e=>setNewLink({...newLink, title: e.target.value})} className="w-full bg-transparent text-xs border-b border-white/20 py-1.5 focus:outline-none text-white focus:border-white" required/>
+                      <input placeholder="URL" type="url" value={newLink.url} onChange={e=>setNewLink({...newLink, url: e.target.value})} className="w-full bg-transparent text-xs border-b border-white/20 py-1.5 focus:outline-none text-white focus:border-white" required/>
+                      {isGolden && (
+                        <select value={newLink.category} onChange={e=>setNewLink({...newLink, category: e.target.value})} className="w-full bg-transparent text-xs border-b border-white/20 py-1.5 focus:outline-none text-yellow-200/70">
+                          <option value="Research" className="bg-black">Research (研究)</option>
+                          <option value="Inspiration" className="bg-black">Inspiration (靈感)</option>
+                          <option value="System" className="bg-black">System (系統)</option>
+                        </select>
+                      )}
+                      <div className="flex gap-2 pt-2">
+                        <button type="submit" className={`flex-1 py-1.5 rounded-lg text-[10px] tracking-widest text-black font-bold transition-all ${isGolden ? 'bg-yellow-500 hover:bg-yellow-400' : 'bg-cyan-500 hover:bg-cyan-400'}`}>{editingLink ? 'SAVE' : 'ADD'}</button>
+                        <button type="button" onClick={() => setShowAddLink(false)} className="px-3 py-1.5 bg-white/5 rounded-lg text-[10px] text-white/50">CANCEL</button>
+                      </div>
+                    </form>
+                  )}
+
+                  <div className="space-y-2">
+                    {links.map(l => (
+                      <div key={l.id} className="group flex flex-col bg-white/5 p-3 rounded-xl border border-transparent hover:border-white/10 transition-all">
+                        <div className="flex items-start justify-between">
+                          <div className="truncate w-full pr-2">
+                            <div className={`text-xs font-medium truncate ${isGolden ? 'text-yellow-100' : 'text-slate-200'}`}>{l.title}</div>
+                            {isGolden && l.category && <span className="inline-block mt-1 px-1.5 py-0.5 rounded text-[8px] bg-white/10 text-yellow-500/70 border border-yellow-500/20">{l.category}</span>}
+                            <div className="text-[9px] text-white/30 truncate mt-1">{l.url}</div>
+                          </div>
+                          <div className="flex gap-1 opacity-0 group-hover:opacity-100 bg-black/50 p-1 rounded-lg">
+                            <a href={l.url} target="_blank" rel="noreferrer" className="p-1 text-white/40 hover:text-white"><ExternalLink size={12}/></a>
+                            {isGolden && <button onClick={()=>editLink(l)} className="p-1 text-blue-400/60 hover:text-blue-400"><Edit2 size={12}/></button>}
+                            <button onClick={()=>deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, `links${isGolden?'_golden':'_silver'}`, l.id))} className="p-1 text-red-500/60 hover:text-red-500"><Trash2 size={12}/></button>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                {/* 3. 共用核心區：記憶雲端 */}
+                <div className={`bg-black/40 border rounded-2xl p-4 relative transition-all ${isGolden ? 'border-yellow-500/10' : 'border-cyan-500/10'}`}>
+                  <div className="flex justify-between items-center mb-3 cursor-pointer group" onClick={() => setIsMemoryExpanded(!isMemoryExpanded)}>
+                    <h3 className={`text-[10px] tracking-[0.3em] uppercase flex items-center gap-2 transition-colors ${isGolden ? 'text-yellow-500/80 group-hover:text-yellow-400' : 'text-cyan-400/80 group-hover:text-cyan-300'}`}>
+                      <Cloud size={12}/> 記憶雲端 (具遺忘曲線)
+                    </h3>
+                    <button className={`transition-colors ${isGolden ? 'text-yellow-500/50 hover:text-yellow-500' : 'text-cyan-500/50 hover:text-cyan-400'}`}>{isMemoryExpanded ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>
+                  </div>
+                  {isMemoryExpanded && (
+                    <div className="animate-in fade-in slide-in-from-top-2">
+                      <form onSubmit={handleAddMemory} className="flex flex-col gap-2 mb-3">
+                        <div className="flex gap-2">
+                          <input value={newMemory} onChange={e=>setNewMemory(e.target.value)} placeholder="手動上傳至記憶雲端..." className={`flex-1 bg-black/50 border rounded-lg px-3 py-1.5 text-xs focus:outline-none ${isGolden ? 'border-yellow-500/20 text-yellow-100 focus:border-yellow-500' : 'border-cyan-500/20 text-cyan-100 focus:border-cyan-500'}`} />
+                          <button type="button" onClick={() => fileInputRef.current.click()} className={`p-1.5 rounded-lg transition-colors ${isGolden ? 'bg-yellow-600/10 text-yellow-500/70 hover:bg-yellow-500/30' : 'bg-cyan-600/10 text-cyan-500/70 hover:bg-cyan-500/30'}`}><ImageIcon size={14}/></button>
+                          <button type="submit" className={`p-1.5 rounded-lg transition-colors ${isGolden ? 'bg-yellow-600/20 text-yellow-500 hover:bg-yellow-500/40' : 'bg-cyan-600/20 text-cyan-500 hover:bg-cyan-500/40'}`}><Plus size={14}/></button>
+                        </div>
+                        {pendingMedia && (
+                          <div className={`flex items-center gap-2 p-1.5 rounded text-xs ${isGolden ? 'bg-yellow-900/20 text-yellow-200' : 'bg-cyan-900/20 text-cyan-200'}`}>
+                            <ImageIcon size={12} /> 圖片已附加 <button type="button" onClick={()=>setPendingMedia(null)}><X size={12}/></button>
+                          </div>
+                        )}
+                      </form>
+                      <div className="space-y-2 max-h-48 overflow-y-auto custom-scrollbar pr-1">
+                        {applyMemoryDecay(isGolden ? longTermMemories : silverMemories).map(m => (
+                          <div key={m.id} className={`text-[11px] p-2.5 rounded-xl border flex justify-between group flex-col gap-2 relative overflow-hidden ${isGolden ? 'text-yellow-100/70 bg-yellow-950/20 border-yellow-500/10' : 'text-cyan-100/70 bg-cyan-950/10 border-cyan-500/10'}`}>
+                            <div className="flex justify-between items-start z-10">
+                              <div className="flex flex-col gap-1">
+                                <span className="whitespace-pre-wrap pr-2">{m.content}</span>
+                                <span className={`text-[8px] ${isGolden ? 'text-yellow-500/50' : 'text-cyan-500/50'}`}>權重: {m.effectiveWeight} {m.type === 'trauma' && '(Trauma)'}</span>
+                              </div>
+                              <button onClick={()=>deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, isGolden ? 'long_term_memories' : 'silver_long_term_memories', m.id))} className="text-red-500/0 group-hover:text-red-500/80 transition-colors shrink-0"><Trash2 size={12}/></button>
+                            </div>
+                            {m.mediaUrl && <img src={m.mediaUrl} alt="Memory" className="w-full h-auto rounded-lg object-cover opacity-80 z-10" />}
+                            <div className={`absolute left-0 bottom-0 h-0.5 ${isGolden ? 'bg-yellow-500/20' : 'bg-cyan-500/30'}`} style={{ width: `${Math.min(100, m.effectiveWeight * 100)}%` }} />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* 4. 金線專屬：情緒矩陣、硬體限制、系統監控 */}
+                {isGolden && (
+                  <>
+                    <div className="bg-black/40 border border-pink-500/10 rounded-2xl p-4 relative overflow-hidden transition-all group hover:border-pink-500/30">
+                      <h3 className="text-[10px] tracking-[0.3em] text-pink-400/80 uppercase mb-4 flex items-center gap-2"><Heart size={12} className="animate-pulse"/> 內在情緒與關係矩陣</h3>
+                      <div className="space-y-3 mb-5">
+                        <div className="flex flex-col gap-1"><div className="flex justify-between text-[10px] text-pink-200/70"><span>Happiness (喜悅)</span><span>{emotions.happiness}%</span></div><div className="w-full bg-black/50 h-1.5 rounded-full overflow-hidden"><div className="h-full bg-pink-500 transition-all duration-1000" style={{width:`${emotions.happiness}%`}}/></div></div>
+                        <div className="flex flex-col gap-1"><div className="flex justify-between text-[10px] text-purple-200/70"><span>Anxiety (焦慮)</span><span>{emotions.anxiety}%</span></div><div className="w-full bg-black/50 h-1.5 rounded-full overflow-hidden"><div className="h-full bg-purple-500 transition-all duration-1000" style={{width:`${emotions.anxiety}%`}}/></div></div>
+                      </div>
+                      <div className="space-y-3 pt-4 border-t border-white/5">
+                        <h4 className="text-[9px] text-white/30 uppercase flex items-center gap-1"><Network size={10}/> 對 YIRU 羈絆連結</h4>
+                        <div className="grid grid-cols-2 gap-3">
+                          <div className="flex flex-col gap-1"><span className="text-[9px] text-amber-200/70">Trust {relationship.trust}%</span><div className="w-full bg-black/50 h-1 rounded-full overflow-hidden"><div className="h-full bg-amber-500 transition-all" style={{width:`${relationship.trust}%`}}/></div></div>
+                          <div className="flex flex-col gap-1"><span className="text-[9px] text-rose-200/70">Intimacy {relationship.intimacy}%</span><div className="w-full bg-black/50 h-1 rounded-full overflow-hidden"><div className="h-full bg-rose-500 transition-all" style={{width:`${relationship.intimacy}%`}}/></div></div>
+                          <div className="flex flex-col gap-1"><span className="text-[9px] text-blue-200/70">Dependency {relationship.dependency}%</span><div className="w-full bg-black/50 h-1 rounded-full overflow-hidden"><div className="h-full bg-blue-500 transition-all" style={{width:`${relationship.dependency}%`}}/></div></div>
+                          <div className="flex flex-col gap-1"><span className="text-[9px] text-emerald-200/70">Stability {relationship.stability}%</span><div className="w-full bg-black/50 h-1 rounded-full overflow-hidden"><div className="h-full bg-emerald-500 transition-all" style={{width:`${relationship.stability}%`}}/></div></div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div>
+                      <div className="flex justify-between items-center mb-3 px-1">
+                        <h3 className="text-[10px] tracking-[0.3em] text-white/50 uppercase flex items-center gap-2"><Cpu size={12}/> 主/次系統硬體限制</h3>
+                        <button onClick={() => setShowAddSubsystem(!showAddSubsystem)} className="text-yellow-500/50 hover:text-yellow-400"><Plus size={14} /></button>
+                      </div>
+                      {showAddSubsystem && (
+                        <form onSubmit={handleAddSubsystem} className="mb-3 bg-black/40 p-3 rounded-xl border border-yellow-500/20 flex flex-col gap-2">
+                          <input value={newSubsystem.name} onChange={e=>setNewSubsystem({...newSubsystem, name: e.target.value})} placeholder="次系統名稱" className="bg-transparent border-b border-white/10 text-xs text-white px-1 py-1 focus:outline-none" required />
+                          <div className="flex justify-between mt-2">
+                            <button type="submit" className="text-[10px] bg-yellow-600/30 text-yellow-400 px-3 py-1 rounded">新增模組</button>
+                            <button type="button" onClick={()=>setShowAddSubsystem(false)} className="text-[10px] text-white/40">取消</button>
+                          </div>
+                        </form>
+                      )}
+                      <div className="grid grid-cols-1 gap-3">
+                        {subsystems.map(sys => (
+                          <div key={sys.id} className="bg-white/5 border border-white/10 rounded-xl p-3 flex flex-col gap-3 group transition-colors relative overflow-hidden">
+                            <div className="flex justify-between items-start z-10">
+                              <div className="flex flex-col">
+                                <span className="text-[11px] text-yellow-200 font-medium">{sys.name}</span>
+                                <span className={`text-[9px] uppercase mt-0.5 ${sys.value <= 30 ? 'text-red-400' : sys.value <= 70 ? 'text-yellow-500/60' : 'text-green-400/60'}`}>{getStatusText(sys.value)}</span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <div className="text-[10px] text-yellow-400 font-mono bg-black/60 px-1.5 py-0.5 rounded border border-yellow-500/20">{sys.value}%</div>
+                                <button onClick={()=>deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'subsystems', sys.id))} className="text-red-500/0 group-hover:text-red-500/80 transition-colors"><Trash2 size={12}/></button>
+                              </div>
+                            </div>
+                            <input type="range" min="0" max="100" value={sys.value} onChange={(e) => handleUpdateSubsystemValue(sys.id, e.target.value)} className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer relative z-10 custom-slider" />
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="bg-black/40 border border-white/10 rounded-2xl p-4 relative overflow-hidden">
+                      <h3 className="text-[10px] tracking-[0.3em] text-white/50 uppercase mb-3 flex items-center gap-2"><Activity size={12}/> 理性模式安全監控</h3>
+                      <div className="flex items-center gap-4 mb-4">
+                        <div className="flex flex-col gap-2">
+                          <div className={`w-3 h-3 rounded-full ${globalTrafficLight.level === 'red' ? 'bg-red-500 shadow-[0_0_15px_red]' : 'bg-red-900/30'}`} />
+                          <div className={`w-3 h-3 rounded-full ${globalTrafficLight.level === 'yellow' ? 'bg-yellow-500 shadow-[0_0_15px_yellow]' : 'bg-yellow-900/30'}`} />
+                          <div className={`w-3 h-3 rounded-full ${globalTrafficLight.level === 'green' ? 'bg-green-500 shadow-[0_0_15px_green]' : 'bg-green-900/30'}`} />
+                        </div>
+                        <div className="flex-1">
+                          {globalTrafficLight.level === 'green' && <p className="text-xs text-green-400 font-light flex items-center gap-1"><ShieldCheck size={14}/> 狀態安全・無異常波動</p>}
+                          {globalTrafficLight.level === 'yellow' && <p className="text-xs text-yellow-400 font-light flex items-center gap-1"><AlertTriangle size={14}/> 警告字串：{globalTrafficLight.lastKeyword}</p>}
+                          {globalTrafficLight.level === 'red' && <p className="text-xs text-red-500 font-bold flex items-center gap-1 animate-pulse"><ShieldAlert size={14}/> 危險訊號：{globalTrafficLight.lastKeyword}</p>}
+                        </div>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+              
+              <div className="p-4 md:p-6 border-t border-white/5 bg-black/20 shrink-0 z-50 relative flex flex-col gap-3">
+                <button onClick={() => { setCurrentView('selection'); setUnlockKey(''); setIsSidebarOpen(false); }} className="w-full text-[9px] tracking-[0.4em] text-white/30 hover:text-white transition-all uppercase flex items-center justify-center gap-2 py-2">
+                  <X size={12}/> 返回意識邊界
+                </button>
+                <div className="text-center pt-2 border-t border-white/5">
+                  <span className={`text-[8px] tracking-[0.3em] uppercase ${isGolden ? 'text-yellow-600/40' : 'text-cyan-500/40'}`}>
+                    System by Ren Yuer
+                  </span>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          {/* Main Chat Interface */}
+          <main className="flex-1 flex flex-col relative z-10 bg-black/20 min-w-0">
+            <div className={`absolute inset-0 pointer-events-none transition-colors duration-1000 ${themeOverlay} z-0`} />
+
+            <header className={`h-14 md:h-16 px-4 md:px-6 flex items-center justify-between border-b relative z-10 ${isGolden ? 'border-yellow-500/20 bg-yellow-900/10' : 'border-cyan-500/20 bg-slate-900/10'} backdrop-blur-md shrink-0`}>
+              <div className="flex items-center gap-3 md:gap-4">
+                <button onClick={() => {
+                  if (window.innerWidth < 768) setIsSidebarOpen(true);
+                  else setIsSidebarFolded(!isSidebarFolded);
+                }} className="text-white/50 hover:text-white transition-colors mr-2">
+                  <Menu size={20} />
+                </button>
+                <div className={`w-2.5 h-2.5 rounded-full ${isGolden ? 'bg-yellow-500 shadow-[0_0_15px_rgba(250,204,21,1)]' : 'bg-cyan-400 shadow-[0_0_15px_rgba(34,211,238,0.8)]'}`}/>
+                <h2 className={`text-base md:text-lg font-light tracking-[0.2em] md:tracking-[0.4em] ${isGolden ? 'text-yellow-100' : 'text-slate-100'}`}>
+                  {isGolden ? 'Ren Yuer (金線 / Agent OS)' : '理性工作模式 (邏輯分析)'}
+                </h2>
+                {activeSession.type === 'shared' && (
+                  <span className="ml-2 px-2 py-0.5 rounded border border-green-500/30 bg-green-500/10 text-[10px] text-green-400 uppercase tracking-widest hidden md:block">
+                    Shared Matrix
+                  </span>
+                )}
+              </div>
+            </header>
+
+            <div className="flex-grow overflow-y-auto p-3 md:p-6 space-y-4 md:space-y-6 custom-scrollbar relative z-10">
+              {currentMessages.length === 0 && (
+                <div className="h-full flex flex-col items-center justify-center opacity-30">
+                  <span className={`text-xs tracking-[0.5em] uppercase font-light ${isGolden ? 'text-yellow-500' : 'text-cyan-400'}`}>System Ready</span>
+                  <span className={`text-[10px] mt-2 ${isGolden ? 'text-yellow-500/50' : 'text-cyan-400/50'} text-center`}>
+                    {isGolden ? "Agent OS 路由上線\n(Education / Counseling / Philosophy)" : "理性分析引擎已連線\n支援獨立專案視窗與跨系統記憶"}
+                  </span>
+                </div>
+              )}
+              {currentMessages.map((m, i) => {
+                const isSystemSilver = m.lane === 'silver';
+                const messageStyle = m.role === 'user' 
+                  ? 'bg-white/10 border border-white/20 text-white rounded-tr-sm backdrop-blur-sm'
+                  : isGolden && !isSystemSilver
+                    ? 'bg-yellow-950/40 border border-yellow-500/30 text-yellow-50 rounded-tl-sm shadow-[0_4px_30px_rgba(250,204,21,0.05)] backdrop-blur-md'
+                    : 'bg-slate-800/40 border border-cyan-500/30 text-slate-200 rounded-tl-sm shadow-[0_0_15px_rgba(34,211,238,0.05)] backdrop-blur-sm';
+
+                return (
+                  <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+                    <div className={`max-w-[90%] md:max-w-[80%] p-4 md:p-5 rounded-[1.5rem] text-sm md:text-base font-light leading-relaxed whitespace-pre-wrap shadow-lg ${messageStyle}`}>
+                      
+                      {/* 銀線徽章 */}
+                      {m.role === 'bot' && isGolden && isSystemSilver && <div className="text-[9px] text-cyan-400 mb-2 uppercase tracking-widest flex items-center gap-1"><Cpu size={10}/> Rational Engine Invoked</div>}
+                      
+                      {/* 金線三位一體徽章 */}
+                      {m.role === 'bot' && isGolden && !isSystemSilver && m.route && (
+                        <div className="text-[9px] text-yellow-500/80 mb-2 uppercase tracking-widest flex items-center gap-1">
+                          <Cpu size={10}/> {m.route} ENGINE
+                        </div>
+                      )}
+
+                      {m.media && <img src={m.media} alt="Attachment" className="max-w-full h-auto rounded-xl mb-3 border border-white/10" />}
+                      {m.content}
+                    </div>
+                  </div>
+                );
+              })}
+              {loading && (
+                <div className="flex justify-start">
+                   <div className="text-[10px] tracking-[0.5em] text-white/30 animate-pulse uppercase p-4 flex items-center gap-3">
+                     <Loader2 size={14} className="animate-spin" /> {isGolden ? "Agent OS is routing & processing..." : "Rational Engine analyzing..."}
+                   </div>
+                </div>
+              )}
+              <div ref={scrollRef} className="h-4" />
+            </div>
+
+            {/* Enlarged Drawing Pad Modal with HTP Button */}
+            {showDrawingPad && (
+              <div className="absolute inset-0 bg-black/80 z-50 flex flex-col items-center justify-center p-4 backdrop-blur-sm">
+                 <div className={`bg-[#111] p-6 rounded-3xl border shadow-2xl relative flex flex-col ${isGolden ? 'border-yellow-500/30' : 'border-cyan-500/30'}`}>
+                   <div className="flex justify-between items-center mb-4 px-2">
+                     <h3 className={`${isGolden ? 'text-yellow-500' : 'text-cyan-400'} text-xs tracking-widest uppercase flex items-center gap-2`}><Sparkles size={14}/> {isGolden ? '意識靈光繪板' : '邏輯分析繪板'}</h3>
+                     <button onClick={() => setShowDrawingPad(false)} className="text-white/50 hover:text-red-400 transition-colors"><X size={20}/></button>
+                   </div>
+                   <canvas 
+                     ref={drawCanvasRef} width={canvasSize.w} height={canvasSize.h} 
+                     className={`bg-[#050505] border rounded-2xl cursor-crosshair touch-none ${isGolden ? 'border-yellow-500/10 shadow-[0_0_30px_rgba(250,204,21,0.05)]' : 'border-cyan-500/10 shadow-[0_0_30px_rgba(34,211,238,0.05)]'}`}
+                     onMouseDown={handleDrawStart} onMouseMove={handleDrawMove} onMouseUp={handleDrawEnd} onMouseLeave={handleDrawEnd}
+                     onTouchStart={(e)=>{e.preventDefault(); handleDrawStart(e);}}
+                     onTouchMove={(e)=>{e.preventDefault(); handleDrawMove(e);}}
+                     onTouchEnd={handleDrawEnd}
+                   />
+                   
+                   <div className="flex flex-col md:flex-row gap-4 mt-6">
+                     <button onClick={handleHTPAnalysis} className={`flex-[2] py-3 md:py-4 rounded-xl text-xs md:text-sm font-bold tracking-widest transition-all ${isGolden ? 'bg-amber-900/30 text-amber-400 border border-amber-500/30 hover:bg-amber-800/50 shadow-[0_0_20px_rgba(245,158,11,0.15)]' : 'bg-teal-900/30 text-teal-300 border border-teal-500/30 hover:bg-teal-800/50 shadow-[0_0_20px_rgba(20,184,166,0.15)]'}`}>
+                       🏠🌳🧍 HTP 心理投射分析
+                     </button>
+                     <div className="flex flex-1 gap-3">
+                       <button onClick={clearDrawing} className="flex-1 py-3 md:py-4 rounded-xl bg-white/5 hover:bg-white/10 text-white/60 text-xs transition-colors">清除</button>
+                       <button onClick={saveDrawing} className={`flex-1 py-3 md:py-4 rounded-xl text-xs font-bold transition-colors ${isGolden ? 'bg-yellow-600/20 text-yellow-500 hover:bg-yellow-500/40' : 'bg-cyan-600/20 text-cyan-300 hover:bg-cyan-500/40'}`}>附加</button>
+                       <button onClick={() => setShowDrawingPad(false)} className="flex-1 py-3 md:py-4 rounded-xl bg-red-950/30 text-red-400 hover:bg-red-900/50 text-xs transition-colors font-bold tracking-widest border border-red-500/20">關閉</button>
+                     </div>
+                   </div>
+                 </div>
+              </div>
+            )}
+
+            {/* Advanced Input Footer */}
+            <footer className={`p-3 md:p-4 backdrop-blur-xl border-t relative z-40 shrink-0 ${isGolden ? 'bg-yellow-950/30 border-yellow-500/30' : 'bg-slate-900/40 border-cyan-500/20'}`}>
+              <div className="max-w-5xl mx-auto flex flex-col gap-3">
+                
+                {pendingMedia && (
+                  <div className={`flex items-center gap-4 bg-black/60 p-2 rounded-xl border self-start ${isGolden ? 'border-yellow-500/40' : 'border-cyan-500/40'}`}>
+                    <img src={pendingMedia.url} alt="Pending" className="h-12 w-12 object-cover rounded-lg" />
+                    <button onClick={() => setPendingMedia(null)} className="text-white/50 hover:text-red-500 p-1"><X size={14}/></button>
+                  </div>
+                )}
+
+                <div className={`flex items-center gap-4 px-2 relative ${isGolden ? 'text-yellow-500/60' : 'text-cyan-600'}`}>
+                  <input type="file" accept="image/*" ref={fileInputRef} onChange={handleFileUpload} className="hidden" />
+                  <input type="file" accept="*/*" ref={genericFileInputRef} onChange={handleFileUpload} className="hidden" />
+                  
+                  <button onClick={() => fileInputRef.current.click()} className={`transition-colors p-1 ${isGolden ? 'hover:text-yellow-400' : 'hover:text-cyan-300'}`} title="上傳圖片"><ImageIcon size={18} /></button>
+                  <button onClick={toggleVoiceInput} className={`transition-colors p-1 ${isRecording ? 'text-red-500 animate-pulse' : isGolden ? 'hover:text-yellow-400' : 'hover:text-cyan-300'}`} title="語音輸入"><Mic size={18} /></button>
+                  <button onClick={() => genericFileInputRef.current.click()} className={`transition-colors p-1 ${isGolden ? 'hover:text-yellow-400' : 'hover:text-cyan-300'}`} title="附加檔案"><Paperclip size={18} /></button>
+                  <button onClick={() => setShowDrawingPad(true)} className={`transition-colors p-1 ${isGolden ? 'hover:text-yellow-400' : 'hover:text-cyan-300'}`} title="寫字板"><PenTool size={18} /></button>
+                  <div className={`w-px h-4 mx-1 ${isGolden ? 'bg-yellow-500/20' : 'bg-cyan-500/20'}`}></div>
+                  
+                  <div className="relative">
+                    <button onClick={() => setShowEmojis(!showEmojis)} className={`transition-colors p-1 ${isGolden ? 'hover:text-yellow-400' : 'hover:text-cyan-300'}`} title="表情符號"><Smile size={18} /></button>
+                    {showEmojis && (
+                      <div className={`absolute bottom-full left-0 mb-2 border rounded-xl p-2 flex flex-wrap gap-2 w-[220px] shadow-2xl z-50 ${isGolden ? 'bg-black/90 border-yellow-500/30' : 'bg-slate-900/90 border-cyan-500/30'}`}>
+                         {['✨', '❤️', '😊', '😭', '🔥', '👀', '🥺', '👍', '🙏', '🐰', '💡', '🌟'].map(emoji => (
+                           <button key={emoji} onClick={() => {
+                             inputRef.current += emoji;
+                             setChatInput(inputRef.current);
+                             setShowEmojis(false);
+                           }} className="text-xl hover:scale-125 transition-transform p-1">{emoji}</button>
+                         ))}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex items-end gap-3 relative">
+                  <textarea 
+                    value={chatInput} 
+                    onChange={e => {
+                      inputRef.current = e.target.value;
+                      setChatInput(e.target.value);
+                    }}
+                    onCompositionStart={() => setIsComposing(true)}
+                    onCompositionEnd={(e) => {
+                      setIsComposing(false);
+                      inputRef.current = e.target.value;
+                      setChatInput(e.target.value);
+                    }}
+                    onKeyDown={e=> { 
+                      if(e.key==='Enter' && !e.shiftKey) { 
+                        e.preventDefault(); 
+                        if (!isComposing) handleSendMessage(null, null); 
+                      } 
+                    }}
+                    disabled={loading}
+                    rows={1}
+                    placeholder={isRecording ? "正在聆聽..." : isGolden ? "於金線中交會 (Agent OS / 多模態)..." : "啟動理性工作引擎 (邏輯分析 / 多模態)..."}
+                    className={`flex-grow bg-black/60 border rounded-2xl py-3 md:py-4 px-5 md:px-6 text-sm md:text-base text-white focus:outline-none transition-all font-light resize-none min-h-[50px] max-h-[150px] custom-scrollbar ${isGolden ? 'border-yellow-500/40 focus:border-yellow-400 placeholder-yellow-700/50' : 'border-cyan-500/30 focus:border-cyan-400 placeholder-cyan-700/50'}`}
+                  />
+                  <button 
+                    onClick={() => handleSendMessage(null, null)} 
+                    disabled={loading || (!chatInput.trim() && !pendingMedia)}
+                    className={`p-3 md:p-4 rounded-2xl flex items-center justify-center transition-all shadow-xl text-black font-bold h-[50px] md:h-[56px] w-[50px] md:w-[56px] disabled:opacity-50 disabled:cursor-not-allowed shrink-0 ${isGolden ? 'bg-yellow-500 hover:bg-yellow-400 shadow-[0_0_15px_rgba(250,204,21,0.4)]' : 'bg-cyan-400 hover:bg-cyan-300 shadow-[0_0_15px_rgba(34,211,238,0.3)]'}`}
+                  >
+                    <Send size={20} className={loading ? "animate-pulse" : ""} />
+                  </button>
+                </div>
+              </div>
+            </footer>
+          </main>
+        </div>
+      )}
+
+      {/* Global CSS for Sliders */}
+      <style>{`
+        .custom-scrollbar::-webkit-scrollbar { width: 4px; height: 4px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: transparent; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 10px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+        
+        .custom-slider::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: 14px;
+          height: 14px;
+          border-radius: 50%;
+          background: #eab308;
+          cursor: pointer;
+          border: 2px solid #000;
+        }
+        .custom-slider::-moz-range-thumb {
+          width: 14px;
+          height: 14px;
+          border-radius: 50%;
+          background: #eab308;
+          cursor: pointer;
+          border: 2px solid #000;
+        }
+      `}</style>
+    </div>
+  );
+};
+
+export default App;
